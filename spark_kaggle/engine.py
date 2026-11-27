@@ -8,6 +8,7 @@ batches gets roughly 500-1200 tok/s per T4 for a 4B fp16 model.
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
 from typing import Any
 
@@ -58,6 +59,11 @@ class Generator:
         self.pad_id = tok.pad_token_id if tok.pad_token_id is not None else self.eos[0]
         self.oom_scale = 1.0
         self.vocab = int(getattr(text_config(model), "vocab_size", 150000))
+        # Long prompts are prefilled in chunks: a single-pass prefill of a 10k+ token prompt can build
+        # [heads, L, L] attention scores on T4 (eager / math-SDPA fallback) and OOM even at batch 1.
+        self.prefill_chunk = int(hw.get("prefill_chunk", 2048) or 0)
+        self.max_total_tokens = int(hw.get("max_total_tokens", 0) or 0)
+        self._chunk_ok: bool | None = None  # None = not validated yet
 
     def _batch_limit(self, seq_len: int) -> int:
         by_tokens = self.max_batch_tokens // max(seq_len, 1)
@@ -81,19 +87,31 @@ class Generator:
         try:
             while i < n:
                 seq_len = len(prompts[order[i]]) + max_new_tokens
+                if self.max_total_tokens and seq_len > self.max_total_tokens:
+                    results[order[i]] = {"ids": [], "finish": "too_long", "stop_id": None}
+                    i += 1
+                    continue
                 bs = min(self._batch_limit(seq_len), n - i)
                 idxs = order[i:i + bs]
+                outs = None
                 try:
                     outs = self._gen_batch([prompts[j] for j in idxs], max_new_tokens, temperature, top_p, top_k)
                 except torch.cuda.OutOfMemoryError:
+                    pass  # handled below, outside the except so the traceback's tensors are already freed
+                if outs is None:
+                    gc.collect()
                     torch.cuda.empty_cache()
-                    if bs == 1:
-                        log.warning("OOM at batch 1 (seq %d) - marking as failed", seq_len)
-                        outs = [{"ids": [], "finish": "oom"}]
-                    else:
+                    if bs > 1:
                         self.oom_scale *= 0.6
                         log.warning("OOM with batch %d (seq %d); scaling batch by %.2f", bs, seq_len, self.oom_scale)
                         continue
+                    if self._chunk_ok is not False and self.prefill_chunk > 512:
+                        self.prefill_chunk //= 2
+                        log.warning("OOM at batch 1 (seq %d); retrying with prefill chunk %d", seq_len,
+                                    self.prefill_chunk)
+                        continue
+                    log.warning("OOM at batch 1 (seq %d) - marking as failed", seq_len)
+                    outs = [{"ids": [], "finish": "oom", "stop_id": None}]
                 for j, o in zip(idxs, outs):
                     results[j] = o
                 i += len(outs)
@@ -103,6 +121,58 @@ class Generator:
             if was_training:
                 self.model.train()
         return results  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ chunked prefill
+
+    def _new_cache(self):
+        from transformers import DynamicCache
+
+        try:
+            return DynamicCache(config=self.model.config)
+        except TypeError:
+            return DynamicCache()
+
+    def _prefill(self, input_ids: torch.Tensor, attn: torch.Tensor, chunk: int):
+        """Run all but the last prompt token through the model in chunks, filling a KV cache that
+        `generate` then continues from."""
+        cache = self._new_cache()
+        pos = (attn.cumsum(-1) - 1).clamp(min=0)
+        end = input_ids.shape[1] - 1
+        with last_position_logits(self.model):
+            for s in range(0, end, chunk):
+                e = min(s + chunk, end)
+                self.model(input_ids=input_ids[:, s:e], attention_mask=attn[:, :e], position_ids=pos[:, s:e],
+                           past_key_values=cache, use_cache=True,
+                           cache_position=torch.arange(s, e, device=input_ids.device))
+        return cache
+
+    def _validate_chunking(self) -> bool:
+        """Once per run: chunked-prefill next-token distribution must match a single-pass prefill."""
+        if self._chunk_ok is not None:
+            return self._chunk_ok
+        try:
+            g = torch.Generator().manual_seed(0)
+            ids = torch.randint(10, min(self.vocab, 30000), (2, 300), generator=g).to(self.device)
+            attn = torch.ones_like(ids)
+            attn[1, :37] = 0  # exercise left padding
+            ids[1, :37] = self.pad_id
+            pos = (attn.cumsum(-1) - 1).clamp(min=0)
+            with last_position_logits(self.model):
+                full = self.model(input_ids=ids, attention_mask=attn, position_ids=pos).logits[:, -1].float()
+                cache = self._prefill(ids, attn, 96)
+                part = self.model(input_ids=ids[:, -1:], attention_mask=attn, position_ids=pos[:, -1:],
+                                  past_key_values=cache, use_cache=True,
+                                  cache_position=torch.tensor([ids.shape[1] - 1], device=ids.device)
+                                  ).logits[:, -1].float()
+            p, q = full.log_softmax(-1), part.log_softmax(-1)
+            kl = float((p.exp() * (p - q)).sum(-1).max())
+            self._chunk_ok = kl < 1e-2
+            log.info("chunked prefill check: KL %.2e -> %s", kl, "enabled" if self._chunk_ok else "DISABLED")
+        except Exception as e:  # remote code without cache_position / Cache support
+            log.warning("chunked prefill unsupported by this model (%s: %s) - single-pass prefill only",
+                        type(e).__name__, str(e)[:200])
+            self._chunk_ok = False
+        return self._chunk_ok
 
     def _gen_batch(self, batch: list[list[int]], max_new_tokens: int, temperature: float, top_p: float,
                    top_k: int) -> list[dict]:
@@ -120,6 +190,8 @@ class Generator:
                               top_k=int(top_k) if top_k else None)
         else:
             gen_kwargs.update(do_sample=False, temperature=None, top_p=None, top_k=None)
+        if self.prefill_chunk and L > self.prefill_chunk and self._validate_chunking():
+            gen_kwargs["past_key_values"] = self._prefill(input_ids, attn, self.prefill_chunk)
         with last_position_logits(self.model):
             out = self.model.generate(input_ids=input_ids, attention_mask=attn, **gen_kwargs)
         new = out[:, L:].tolist()

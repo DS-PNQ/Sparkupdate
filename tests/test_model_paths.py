@@ -133,3 +133,23 @@ def test_abliteration_pipeline_on_tiny(model, tok, fmt):
     assert probe.kl() > 0
     restore_writers(model, bk)
     assert probe.kl() < 1e-3
+
+
+def test_chunked_prefill_matches_single_pass(model, tok, fmt):
+    prompts = [fmt.prompt_ids([{"role": "user", "content": "weather in Paris and the flights to SFO " * k}], None,
+                              "nothink") for k in (3, 7, 12)]
+    assert max(len(p) for p in prompts) > 64
+    plain = Generator(model, tok, {**HW, "prefill_chunk": 0}, torch.device("cpu"))
+    chunked = Generator(model, tok, {**HW, "prefill_chunk": 16}, torch.device("cpu"))
+    a = plain.generate(prompts, 12, temperature=0.0)
+    b = chunked.generate(prompts, 12, temperature=0.0)
+    assert chunked._chunk_ok is True
+    assert [x["ids"] for x in a] == [x["ids"] for x in b]
+
+
+def test_too_long_prompts_are_skipped(model, tok, fmt):
+    gen = Generator(model, tok, {**HW, "max_total_tokens": 40}, torch.device("cpu"))
+    short = fmt.prompt_ids([{"role": "user", "content": "hi"}], None, "nothink")
+    long = fmt.prompt_ids([{"role": "user", "content": "flights " * 80}], None, "nothink")
+    out = gen.generate([long, short], 4, temperature=0.0)
+    assert out[0]["finish"] == "too_long" and out[1]["finish"] in ("stop", "length")

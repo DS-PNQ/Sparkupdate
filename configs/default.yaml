@@ -14,6 +14,8 @@ hardware:
   gen_max_batch_size: 48
   kv_mem_fraction: 0.55     # share of free VRAM the KV cache may use when sizing generate batches
   kv_bytes_per_token: null  # null -> config upper bound; preflight measures the real value (sliding layers)
+  prefill_chunk: 2048       # prompts longer than this are prefilled in chunks (avoids [heads, L, L] OOM on T4)
+  max_total_tokens: 20480   # prompt + max_new above this is skipped (finish="too_long") instead of attempted
 
 chat:
   # Passed to tokenizer.apply_chat_template. Spark-X2.6 exposes thinking levels (none/low/high);

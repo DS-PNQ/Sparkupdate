@@ -41,7 +41,7 @@ def eval_tool(gen, fmt, tasks, mode, max_new, gk) -> dict:
         ok = bool(v["pass"]) and o["finish"] == "stop"
         by_cat[t["category"]].append((ok, v["format_ok"], v["name_f1"]))
         if not ok:
-            fails[v.get("fail_reason") or o["finish"]] += 1
+            fails[o["finish"] if o["finish"] in ("oom", "too_long") else (v.get("fail_reason") or o["finish"])] += 1
     res = {"n": len(tasks), "accuracy": sum(x[0] for v in by_cat.values() for x in v) / max(len(tasks), 1)}
     res["by_category"] = {c: round(sum(x[0] for x in v) / len(v), 4) for c, v in sorted(by_cat.items())}
     res["format_ok"] = sum(x[1] for v in by_cat.values() for x in v) / max(len(tasks), 1)
@@ -57,6 +57,7 @@ def eval_code(gen, fmt, tasks, mode, max_new, gk) -> dict:
     for t, v in zip(tasks, ver):
         by_src[t["source"]].append(bool(v["pass"]))
     return {"n": len(tasks), "pass@1": sum(v["pass"] for v in ver) / max(len(tasks), 1),
+            "oom_or_too_long": sum(o["finish"] in ("oom", "too_long") for o in outs),
             "by_source": {s: round(sum(v) / len(v), 4) for s, v in by_src.items()}}
 
 
