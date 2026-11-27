@@ -1,0 +1,13 @@
+# Installed on top of Kaggle's preinstalled CUDA PyTorch (do NOT reinstall torch).
+# Spark-X2.6 remote code is pinned to transformers 4.57.1 by its authors; that release needs
+# huggingface_hub < 1.0, which in turn caps `datasets`.
+transformers==4.57.1
+huggingface_hub>=0.34,<1.0
+datasets>=3.6,<4.3
+peft>=0.17,<0.23
+accelerate>=1.0
+optuna>=4.0
+bitsandbytes>=0.45      # only used with sft.quant=nf4 (QLoRA); supports sm_75
+pyyaml
+jinja2
+pytest                  # runs unit tests of model-written code

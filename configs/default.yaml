@@ -1,0 +1,173 @@
+# Spark-X2.6-4B -> agentic coding / tool calling improvement + abliteration
+# Target hardware: Kaggle "GPU T4 x2" (2 x 15 GB, sm_75, fp16 only, no FlashAttention-2).
+# Every value can be overridden on the command line:  --set sft.lr=5e-5
+
+model_id: XHToken/Spark-X2.6-4B       # HF repo or local path of the starting checkpoint
+run_dir: /kaggle/working/spark_run     # persisted outputs (Kaggle keeps /kaggle/working, 20 GB cap)
+scratch_dir: /tmp/spark_scratch        # big intermediate files (merged weights) - not persisted
+seed: 1234
+
+hardware:
+  dtype: float16            # T4 has no bf16 tensor cores; fp16 is the fast path
+  attn_implementation: sdpa # FA2 needs sm_80+. Falls back to eager automatically.
+  gen_max_batch_tokens: 98304 # (prompt+new tokens) * batch budget per GPU for generation
+  gen_max_batch_size: 48
+  kv_mem_fraction: 0.55     # share of free VRAM the KV cache may use when sizing generate batches
+  kv_bytes_per_token: null  # null -> config upper bound; preflight measures the real value (sliding layers)
+
+chat:
+  # Passed to tokenizer.apply_chat_template. Spark-X2.6 exposes thinking levels (none/low/high);
+  # run `python -m spark_kaggle.preflight` - it prints the template's variables so you can add
+  # e.g. `thinking_level: low` (whatever name the template uses) to think_kwargs.
+  think_kwargs: {enable_thinking: true}
+  nothink_kwargs: {enable_thinking: false}
+  system_prompt: null       # null -> template default
+  tool_args_mode: auto      # auto | dict | json_string  (how tool_call arguments are passed to the template)
+
+sampling:                   # Spark recommends temperature=1.0, top_p=0.95, top_k disabled
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 0
+
+tasks:
+  out_dir: ${run_dir}/tasks
+  eval_fraction: 0.05
+  max_eval_per_source: 200
+  tool_sources:
+    - {name: xlam, hf_id: Salesforce/xlam-function-calling-60k, split: train, limit: 2500}       # gated: accept terms on HF
+    - {name: hermes, hf_id: NousResearch/hermes-function-calling-v1, config: func_calling_singleturn, split: train, limit: 600}
+    - {name: hermes, hf_id: NousResearch/hermes-function-calling-v1, config: func_calling, split: train, limit: 600}
+    - {name: apigen_mt, hf_id: Salesforce/APIGen-MT-5k, split: train, limit: 800}              # gated, multi-turn
+    # - {name: openai_jsonl, path: /kaggle/input/my-data/tools.jsonl, limit: 1000}            # your own data
+  irrelevance_fraction: 0.15    # tool tasks rewritten so no offered tool fits -> must NOT call a tool
+  distractor_tools: [1, 4]      # add N random unrelated tools to each task (BFCL "multiple" style)
+  code_sources:
+    - {name: mbpp, hf_id: google-research-datasets/mbpp, config: full, split: train, limit: 374}
+    - {name: kodcode, hf_id: KodCode/KodCode-V1, split: train, limit: 1500}
+  code_eval_sources:
+    - {name: humaneval, hf_id: openai/openai_humaneval, split: test, limit: 164}
+    - {name: mbpp, hf_id: google-research-datasets/mbpp, config: full, split: test, limit: 200}
+  agent_tasks: 700              # synthetic repo tasks (bug-repair + implement) built from code sources
+  agent_eval_tasks: 80
+  repair_fraction: 0.6
+
+collect:                        # rejection-sampling self-distillation (RFT) + preference pairs
+  samples_per_task: 4
+  think_fraction: 0.5           # fraction of tasks sampled in thinking mode (rest no-think)
+  max_new_tokens_think: 3072
+  max_new_tokens_nothink: 768
+  agent_max_turns: 10
+  agent_max_new_tokens: 1536    # per agent turn
+  agent_max_context: 8192      # keep agent turns trainable (sft.max_seq_len)
+  time_budget_hours: 5.0        # stop gracefully and keep everything collected so far
+  task_types: [tool, code, agent]
+  # SFT selection
+  max_sft_per_task: 2
+  easy_task_keep_prob: 0.3      # tasks solved by every sample carry little signal
+  gold_fallback_fraction: 0.5   # tool tasks never solved -> train on the gold call (no-think render)
+  # DPO selection
+  max_pairs_per_task: 2
+  replay_general: 0             # optional: N general prompts self-distilled as replay (needs dataset)
+
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: all-linear
+  use_rslora: false
+
+sft:
+  quant: none                   # none (fp16 base, fastest on T4) | nf4 (QLoRA, for long sequences)
+  max_seq_len: 8192             # OOM in the start-up memory probe? -> 6144, or quant=nf4
+  micro_batch_tokens: 8192      # padded tokens per micro-batch per GPU
+  global_batch_tokens: 131072   # tokens per optimizer step across both GPUs
+  lr: 1.0e-4
+  min_lr_ratio: 0.1
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  epochs: 1
+  max_grad_norm: 1.0
+  save_every_steps: 50
+  loss_chunk: 512               # chunked lm_head + CE (never materialise full-vocab logits)
+  out_dir: ${run_dir}/adapters/sft
+
+dpo:
+  quant: none
+  init_adapters: ["${run_dir}/adapters/sft/final"]   # merged into the base first (= reference policy)
+  beta: 0.1
+  sft_weight: 0.2               # RPO-style NLL on chosen, guards against likelihood displacement
+  lr: 5.0e-6
+  pairs_per_step: 32
+  max_seq_len: 4096             # a pair = 2 sequences -> keep below SFT's length on 15 GB
+  epochs: 1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  save_every_steps: 25
+  loss_chunk: 1024
+  out_dir: ${run_dir}/adapters/dpo
+  # resume DPO on new pairs collected from the SFT policy (more on-policy):
+  #   python -m spark_kaggle.collect --launch --tag sft --adapters ${run_dir}/adapters/sft/final
+
+grpo:                           # optional, expensive on T4: verifiable-reward RL on tool calls / code
+  enabled: false
+  init_adapters: ["${run_dir}/adapters/sft/final", "${run_dir}/adapters/dpo/final"]
+  steps: 60                     # ~3-4 min/step on 2x T4 -> ~3.5 h
+  prompts_per_step: 8           # per GPU
+  group_size: 6
+  mode: nothink
+  max_new_tokens: 768
+  lr: 2.0e-5
+  beta_kl: 0.0                  # Dr.GRPO / DAPO style: no KL term
+  scale_rewards: false          # Dr.GRPO: do not divide advantages by std
+  task_types: [tool, code]
+  only_hard: true               # train on tasks the policy did not solve every time during collection
+  save_every_steps: 10
+  loss_chunk: 1024
+  out_dir: ${run_dir}/adapters/grpo
+
+merge:
+  adapters: ["${run_dir}/adapters/sft/final", "${run_dir}/adapters/dpo/final"]
+  out_dir: ${scratch_dir}/merged
+  save_dtype: bfloat16
+
+abliterate:
+  source_model: ${scratch_dir}/merged
+  out_dir: ${run_dir}/final_abliterated
+  harmful: {hf_id: mlabonne/harmful_behaviors, column: text}
+  harmless: {hf_id: mlabonne/harmless_alpaca, column: text}
+  n_measure: 256                # prompts per side for direction measurement
+  measure_modes: [think, nothink]
+  measure_positions: [-1]       # token positions (from the end of the prompt) averaged
+  projected: true               # orthogonalise refusal dir against harmless mean (biprojection)
+  norm_preserve: true           # keep per-column weight norms (grimjim)
+  ablate_embeddings: false
+  n_trials: 40
+  n_startup_trials: 12
+  n_refusal_prompts: 64
+  n_kl_prompts: 64
+  kl_tokens: 24                 # KL averaged over the base model's first N answer tokens (teacher forced)
+  refusal_max_new_tokens: 96
+  target_refusal_rate: 0.05
+  kl_weight: 1.0
+  direction_layer_range: [0.3, 0.9]   # fraction of depth to search the source direction in
+  validate_n: 100               # held-out harmful prompts for the final check (thinking on)
+  validate_max_new_tokens: 1024
+
+eval:
+  suites: [tool, code, agent, refusal]
+  modes: [nothink, think]
+  max_tool: 400
+  max_code: 164
+  max_agent: 80
+  max_refusal: 100
+  max_new_tokens_think: 4096
+  max_new_tokens_nothink: 1024
+  temperature: 0.0              # 0 -> greedy; set 1.0 to follow Spark's sampling recommendation
+  out_dir: ${run_dir}/eval
+
+export:
+  hub_repo: null                # e.g. your-name/Spark-X2.6-4B-agentic-abliterated
+  private: true
+  gguf: false
+  gguf_types: [q8_0]            # q8_0 / f16 need no build; q4_k_m builds llama-quantize (~10 min)
+  llama_cpp_ref: master
